@@ -1,5 +1,10 @@
 __pycache__
 .vscode
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
 *.code-workspace
 models/
 # SuperBeasts model weights
