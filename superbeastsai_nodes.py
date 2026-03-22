@@ -1,5 +1,5 @@
 import numpy as np
-from PIL import Image, ImageOps, ImageDraw, ImageFilter, ImageEnhance, ImageCms
+from PIL import Image, ImageOps, ImageDraw, ImageFilter, ImageEnhance
 from PIL.PngImagePlugin import PngInfo
 import torch
 import torch.nn.functional as F
@@ -597,16 +597,92 @@ class SBLoadModel:
         return (model_info, )
 
 
-sRGB_profile = ImageCms.createProfile("sRGB")
-Lab_profile = ImageCms.createProfile("LAB")
-
 # Tensor to PIL
 def tensor2pil(image):
-    return Image.fromarray(np.clip(255. * image.cpu().numpy().squeeze(), 0, 255).astype(np.uint8))
+    arr = image.detach().cpu().numpy()
+    if arr.ndim == 4:
+        arr = arr[0]
+    if arr.ndim == 2:
+        return Image.fromarray(np.clip(arr * 255.0, 0, 255).astype(np.uint8), mode='L')
+    if arr.ndim == 3 and arr.shape[-1] == 1:
+        return Image.fromarray(np.clip(arr[..., 0] * 255.0, 0, 255).astype(np.uint8), mode='L')
+    if arr.ndim != 3:
+        raise ValueError(f"Expected image tensor with 2 or 3 dims, got shape {arr.shape}")
+    return Image.fromarray(np.clip(arr * 255.0, 0, 255).astype(np.uint8))
 
 # PIL to Tensor
 def pil2tensor(image):
     return torch.from_numpy(np.array(image).astype(np.float32) / 255.0).unsqueeze(0)
+
+
+_LAB_EPSILON = 216.0 / 24389.0
+_LAB_KAPPA = 24389.0 / 27.0
+_D65_WHITE = np.array([0.95047, 1.0, 1.08883], dtype=np.float32)
+_SRGB_TO_XYZ = np.array([
+    [0.4124564, 0.3575761, 0.1804375],
+    [0.2126729, 0.7151522, 0.0721750],
+    [0.0193339, 0.1191920, 0.9503041],
+], dtype=np.float32)
+_XYZ_TO_SRGB = np.array([
+    [ 3.2404542, -1.5371385, -0.4985314],
+    [-0.9692660,  1.8760108,  0.0415560],
+    [ 0.0556434, -0.2040259,  1.0572252],
+], dtype=np.float32)
+
+
+def _srgb_to_linear(rgb):
+    rgb = np.asarray(rgb, dtype=np.float32)
+    return np.where(rgb <= 0.04045, rgb / 12.92, ((rgb + 0.055) / 1.055) ** 2.4)
+
+
+def _linear_to_srgb(rgb):
+    rgb = np.asarray(rgb, dtype=np.float32)
+    return np.where(rgb <= 0.0031308, 12.92 * rgb, 1.055 * np.power(np.clip(rgb, 0.0, None), 1.0 / 2.4) - 0.055)
+
+
+def _f_xyz_to_lab(t):
+    return np.where(t > _LAB_EPSILON, np.cbrt(t), (_LAB_KAPPA * t + 16.0) / 116.0)
+
+
+def _f_lab_to_xyz(t):
+    t3 = t ** 3
+    return np.where(t3 > _LAB_EPSILON, t3, (116.0 * t - 16.0) / _LAB_KAPPA)
+
+
+def _rgb_to_lab_components(img: Image.Image):
+    rgb = np.asarray(img.convert('RGB'), dtype=np.float32) / 255.0
+    linear_rgb = _srgb_to_linear(rgb)
+    xyz = linear_rgb @ _SRGB_TO_XYZ.T
+    xyz = xyz / _D65_WHITE
+
+    f_xyz = _f_xyz_to_lab(xyz)
+    l = (116.0 * f_xyz[..., 1]) - 16.0
+    a = 500.0 * (f_xyz[..., 0] - f_xyz[..., 1])
+    b = 200.0 * (f_xyz[..., 1] - f_xyz[..., 2])
+
+    l_uint8 = np.clip(l * (255.0 / 100.0), 0, 255).astype(np.uint8)
+    return l_uint8, a.astype(np.float32, copy=False), b.astype(np.float32, copy=False)
+
+
+def _lab_components_to_rgb(l_uint8: np.ndarray, a: np.ndarray, b: np.ndarray) -> Image.Image:
+    lab = np.empty((l_uint8.shape[0], l_uint8.shape[1], 3), dtype=np.float32)
+    lab[..., 0] = np.asarray(l_uint8, dtype=np.float32) * (100.0 / 255.0)
+    lab[..., 1] = np.asarray(a, dtype=np.float32)
+    lab[..., 2] = np.asarray(b, dtype=np.float32)
+
+    fy = (lab[..., 0] + 16.0) / 116.0
+    fx = lab[..., 1] / 500.0 + fy
+    fz = fy - lab[..., 2] / 200.0
+
+    xyz = np.empty_like(lab)
+    xyz[..., 0] = _f_lab_to_xyz(fx)
+    xyz[..., 1] = _f_lab_to_xyz(fy)
+    xyz[..., 2] = _f_lab_to_xyz(fz)
+    xyz = xyz * _D65_WHITE
+
+    linear_rgb = xyz @ _XYZ_TO_SRGB.T
+    rgb = np.clip(_linear_to_srgb(linear_rgb), 0.0, 1.0)
+    return Image.fromarray((rgb * 255.0 + 0.5).astype(np.uint8), mode='RGB')
 
 
 def adjust_shadows(luminance_array, shadow_intensity, hdr_intensity):
@@ -716,17 +792,16 @@ class HDREffects:
     
     @apply_to_batch
     def apply_hdr2(self, image, hdr_intensity=0.5, shadow_intensity=0.25, highlight_intensity=0.75, gamma_intensity=0.25, contrast=0.1, enhance_color=0.25):
-        # Load the image
-        img = tensor2pil(image)
-        
-        # Step 1: Convert RGB to LAB for better color preservation
-        img_lab = ImageCms.profileToProfile(img, sRGB_profile, Lab_profile, outputMode='LAB')
+        # Load the image and force a stable RGB input mode.
+        img = tensor2pil(image).convert('RGB')
 
-        # Extract L, A, and B channels
-        luminance, a, b = img_lab.split()
-        
+        # Convert to LAB without relying on Pillow/ImageCms. The CMS path can
+        # segfault inside the C extension on some Python/Pillow builds.
+        l_uint8, a_channel, b_channel = _rgb_to_lab_components(img)
+        luminance = Image.fromarray(l_uint8, mode='L')
+
         # Convert luminance to a NumPy array for processing
-        lum_array = np.array(luminance, dtype=np.float32)
+        lum_array = l_uint8.astype(np.float32)
 
         # Preparing adjustment layers (shadows, midtones, highlights)
         # This example assumes you have methods to extract or calculate these adjustments
@@ -738,14 +813,13 @@ class HDREffects:
 
         # Apply gamma correction with a base_gamma value (define based on desired effect)
         gamma_corrected = apply_gamma_correction(np.array(merged_adjustments), gamma_intensity)
-        gamma_corrected = Image.fromarray(gamma_corrected).resize(a.size)
+        if gamma_corrected.shape != l_uint8.shape:
+            gamma_corrected = np.array(
+                Image.fromarray(gamma_corrected, mode='L').resize((l_uint8.shape[1], l_uint8.shape[0]))
+            )
 
-
-        # Merge L channel back with original A and B channels
-        adjusted_lab = Image.merge('LAB', (gamma_corrected, a, b))
-
-        # Step 3: Convert LAB back to RGB
-        img_adjusted = ImageCms.profileToProfile(adjusted_lab, Lab_profile, sRGB_profile, outputMode='RGB')
+        # Merge L channel back with original A/B components and convert back to RGB.
+        img_adjusted = _lab_components_to_rgb(gamma_corrected, a_channel, b_channel)
         
         
         # Enhance contrast
