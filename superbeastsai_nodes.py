@@ -836,6 +836,7 @@ def _hdr_progress(frame_pixels: int, msg: str) -> None:
 
 
 def _spca_debug(msg: str) -> None:
+    """Print SPCA diagnostics when debug logging is enabled."""
     if _safe_bool_env("SUPERBEASTS_SPCA_DEBUG", False):
         print(f"[SuperBeasts][SPCA] {msg}")
 
@@ -2192,6 +2193,10 @@ class SuperPopColorAdjustment:
 
     The node calls the provided *SBModel* once to obtain a fully-corrected reference image (Requires use of "SB Load Model" node).  It then blends that result back into the
     original image `count` times using evenly spaced strength values between `max_strength/count` and `max_strength` (inclusive).
+
+    Set ``SUPERBEASTS_SPCA_RETURN_RESIDUALS=false`` to reduce peak memory when
+    the residual output is unused. This intentionally returns an empty residual
+    list and is incompatible with a connected Super Pop Residual Blend node.
     """
     DESCRIPTION = __doc__
 
@@ -2425,6 +2430,12 @@ class SuperPopColorAdjustment:
 
         frame_pixels = height * width
         return_residuals = _safe_bool_env("SUPERBEASTS_SPCA_RETURN_RESIDUALS", True)
+        if not return_residuals:
+            print(
+                "[SuperBeasts][SPCA] Warning: residual output is disabled; "
+                "connected Super Pop Residual Blend nodes cannot consume this result.",
+                file=sys.stderr,
+            )
 
         # Allocate the output batch only when the first frame is ready to be
         # written.  During model patch accumulation this avoids overlapping the
@@ -2585,28 +2596,10 @@ class SuperPopColorAdjustment:
                     counter[y:y + target_h, x:x + target_w, :] += weight[:, :, np.newaxis]
 
                     # Drop per-patch native temporaries before the next model call.
+                    del patch, patch_corrected, orig_patch_np, corr_patch_np, residual_patch, weight
+                    # These temporaries exist only for edge patches.
                     with contextlib.suppress(NameError):
-                        del patch
-                    with contextlib.suppress(NameError):
-                        del patch_corrected
-                    with contextlib.suppress(NameError):
-                        del orig_patch_np
-                    with contextlib.suppress(NameError):
-                        del corr_patch_np
-                    with contextlib.suppress(NameError):
-                        del residual_patch
-                    with contextlib.suppress(NameError):
-                        del weight
-                    with contextlib.suppress(NameError):
-                        del orig_cropped
-                    with contextlib.suppress(NameError):
-                        del orig_pad
-                    with contextlib.suppress(NameError):
-                        del pad_pil
-                    with contextlib.suppress(NameError):
-                        del corrected_pad_np
-                    with contextlib.suppress(NameError):
-                        del corrected_crop
+                        del orig_cropped, orig_pad, pad_pil, corrected_pad_np, corrected_crop
 
                     if patch_index % 16 == 0 or patch_index == total_patches:
                         _spca_progress(frame_pixels, f"{frame_label}: patch accumulation {patch_index}/{total_patches}")
