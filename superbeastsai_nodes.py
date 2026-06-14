@@ -825,6 +825,23 @@ def _hdr_debug(msg: str) -> None:
         print(f"[SuperBeasts][HDR] {msg}")
 
 
+def _hdr_progress(frame_pixels: int, msg: str) -> None:
+    """Print coarse progress for large HDR frames without flooding small runs."""
+    if _safe_bool_env("SUPERBEASTS_HDR_DEBUG", False):
+        print(f"[SuperBeasts][HDR] {msg}")
+        return
+    min_pixels = _safe_positive_int_env("SUPERBEASTS_HDR_PROGRESS_MIN_PIXELS", 4_000_000, 1)
+    if int(frame_pixels) >= min_pixels:
+        print(f"[SuperBeasts][HDR] {msg}")
+
+
+def _hdr_use_streaming(height: int, width: int) -> bool:
+    if not _safe_bool_env("SUPERBEASTS_HDR_STREAMING", True):
+        return False
+    min_pixels = _safe_positive_int_env("SUPERBEASTS_HDR_STREAMING_MIN_PIXELS", 4_000_000, 1)
+    return int(height) * int(width) >= min_pixels
+
+
 _LIBC_MALLOC_TRIM = None
 _LIBC_MALLOC_TRIM_PROBED = False
 _LIBC_MALLOC_TRIM_WARNED = False
@@ -892,27 +909,49 @@ def _tensor_image_to_rgb_u8_chunked(image: torch.Tensor) -> np.ndarray:
     if channels not in (1, 3, 4):
         raise ValueError(f"Expected 1, 3, or 4 channels, got tensor shape {tuple(tensor.shape)}")
 
-    arr = np.ascontiguousarray(tensor.numpy())
     rgb_u8 = np.empty((height, width, 3), dtype=np.uint8)
     rows_per_chunk = _hdr_rows_per_chunk(width)
 
     for y0 in range(0, height, rows_per_chunk):
         y1 = min(height, y0 + rows_per_chunk)
-        chunk = arr[y0:y1]
-        if channels == 1:
-            src = chunk[..., 0]
-            tmp = np.clip(src * 255.0, 0.0, 255.0).astype(np.uint8)
-            rgb_u8[y0:y1, :, 0] = tmp
-            rgb_u8[y0:y1, :, 1] = tmp
-            rgb_u8[y0:y1, :, 2] = tmp
-            del tmp
-        else:
-            tmp = np.clip(chunk[..., :3] * 255.0, 0.0, 255.0).astype(np.uint8)
-            rgb_u8[y0:y1] = tmp
-            del tmp
-        del chunk
+        rgb_u8[y0:y1] = _tensor_image_rows_to_rgb_u8(tensor, y0, y1)
 
     return rgb_u8
+
+
+def _tensor_image_rows_to_rgb_u8(image: torch.Tensor, y0: int, y1: int) -> np.ndarray:
+    """Convert only rows [y0:y1] of one Comfy IMAGE frame to RGB uint8."""
+    tensor = image.detach()
+    if tensor.ndim == 4:
+        if tensor.shape[0] != 1:
+            raise ValueError(f"Expected a single frame, got tensor shape {tuple(tensor.shape)}")
+        tensor = tensor[0]
+    if tensor.ndim == 2:
+        tensor = tensor.unsqueeze(-1)
+    if tensor.ndim != 3:
+        raise ValueError(f"Expected image tensor with shape HxWxC, got {tuple(tensor.shape)}")
+
+    height, width, channels = (int(v) for v in tensor.shape)
+    if channels not in (1, 3, 4):
+        raise ValueError(f"Expected 1, 3, or 4 channels, got tensor shape {tuple(tensor.shape)}")
+
+    y0 = max(0, int(y0))
+    y1 = min(height, int(y1))
+    if y1 <= y0:
+        return np.empty((0, width, 3), dtype=np.uint8)
+
+    chunk = tensor[y0:y1].detach().cpu()
+    arr = np.ascontiguousarray(chunk.numpy())
+    if channels == 1:
+        src = arr[..., 0]
+        gray = np.clip(src * 255.0, 0.0, 255.0).astype(np.uint8)
+        rgb = np.empty((y1 - y0, width, 3), dtype=np.uint8)
+        rgb[..., 0] = gray
+        rgb[..., 1] = gray
+        rgb[..., 2] = gray
+        return rgb
+
+    return np.clip(arr[..., :3] * 255.0, 0.0, 255.0).astype(np.uint8)
 
 
 def _rgb_luma_float(rgb: np.ndarray) -> np.ndarray:
@@ -928,6 +967,34 @@ def _rgb_luma_sum(rgb_u8: np.ndarray) -> float:
         y1 = min(height, y0 + rows_per_chunk)
         total += float(_rgb_luma_float(rgb_u8[y0:y1]).sum(dtype=np.float64))
     return total
+
+
+def _postprocess_rgb_u8_chunk_to_np(
+    rgb_u8: np.ndarray,
+    out_np: np.ndarray,
+    mean_luma: np.float32,
+    contrast_factor: np.float32,
+    color_factor: np.float32,
+) -> None:
+    """Apply HDR contrast/color postprocess to one RGB uint8 chunk."""
+    work = rgb_u8.astype(np.float32)
+
+    if contrast_factor != 1.0:
+        work *= contrast_factor
+        work += mean_luma * np.float32(1.0 - contrast_factor)
+        np.clip(work, 0.0, 255.0, out=work)
+
+    if color_factor != 1.0:
+        gray = _rgb_luma_float(work)
+        work *= color_factor
+        work += gray[..., None] * np.float32(1.0 - color_factor)
+        np.clip(work, 0.0, 255.0, out=work)
+        del gray
+
+    work *= np.float32(1.0 / 255.0)
+    np.clip(work, 0.0, 1.0, out=work)
+    out_np[...] = work
+    del work
 
 
 def _postprocess_rgb_u8_to_tensor_chunked(
@@ -958,24 +1025,13 @@ def _postprocess_rgb_u8_to_tensor_chunked(
 
     for y0 in range(0, height, rows_per_chunk):
         y1 = min(height, y0 + rows_per_chunk)
-        work = rgb_u8[y0:y1].astype(np.float32)
-
-        if contrast_factor != 1.0:
-            work *= contrast_factor
-            work += mean_luma * np.float32(1.0 - contrast_factor)
-            np.clip(work, 0.0, 255.0, out=work)
-
-        if color_factor != 1.0:
-            gray = _rgb_luma_float(work)
-            work *= color_factor
-            work += gray[..., None] * np.float32(1.0 - color_factor)
-            np.clip(work, 0.0, 255.0, out=work)
-            del gray
-
-        work *= np.float32(1.0 / 255.0)
-        np.clip(work, 0.0, 1.0, out=work)
-        out_np[y0:y1] = work
-        del work
+        _postprocess_rgb_u8_chunk_to_np(
+            rgb_u8[y0:y1],
+            out_np[y0:y1],
+            mean_luma=mean_luma,
+            contrast_factor=contrast_factor,
+            color_factor=color_factor,
+        )
 
 
 def _srgb_to_linear(rgb):
@@ -1242,6 +1298,51 @@ def _lab_chunk_to_rgb_u8(l_uint8: np.ndarray, a: np.ndarray, b: np.ndarray) -> n
     return out
 
 
+def _apply_hdr_effect_u8_one_chunk(
+    rgb_chunk_u8: np.ndarray,
+    hdr_intensity: float,
+    shadow_intensity: float,
+    highlight_intensity: float,
+    gamma_intensity: float,
+) -> np.ndarray:
+    """Apply HDR luminance adjustment to one RGB uint8 row chunk."""
+    rgb = rgb_chunk_u8.astype(np.float32) / 255.0
+    linear_rgb = _srgb_to_linear(rgb)
+
+    r = linear_rgb[..., 0]
+    g = linear_rgb[..., 1]
+    bl = linear_rgb[..., 2]
+
+    x = (_SRGB_TO_XYZ[0, 0] * r + _SRGB_TO_XYZ[0, 1] * g + _SRGB_TO_XYZ[0, 2] * bl) / _D65_WHITE[0]
+    y = (_SRGB_TO_XYZ[1, 0] * r + _SRGB_TO_XYZ[1, 1] * g + _SRGB_TO_XYZ[1, 2] * bl) / _D65_WHITE[1]
+    z = (_SRGB_TO_XYZ[2, 0] * r + _SRGB_TO_XYZ[2, 1] * g + _SRGB_TO_XYZ[2, 2] * bl) / _D65_WHITE[2]
+
+    fx = _f_xyz_to_lab(x)
+    fy = _f_xyz_to_lab(y)
+    fz = _f_xyz_to_lab(z)
+
+    lightness = (np.float32(116.0) * fy) - np.float32(16.0)
+    a = np.float32(500.0) * (fx - fy)
+    b = np.float32(200.0) * (fy - fz)
+
+    l_uint8 = np.clip(lightness * (255.0 / 100.0), 0, 255).astype(np.uint8)
+    adjusted_l = _apply_hdr_luminance_chunk(
+        l_uint8,
+        hdr_intensity=hdr_intensity,
+        shadow_intensity=shadow_intensity,
+        highlight_intensity=highlight_intensity,
+        gamma_intensity=gamma_intensity,
+    )
+    stable_a, stable_b = _stabilize_dark_lab_chroma(rgb_chunk_u8, l_uint8, adjusted_l, a, b)
+    out = _lab_chunk_to_rgb_u8(adjusted_l, stable_a, stable_b)
+
+    del (
+        rgb, linear_rgb, r, g, bl, x, y, z, fx, fy, fz, lightness,
+        a, b, l_uint8, adjusted_l, stable_a, stable_b,
+    )
+    return out
+
+
 def _apply_hdr_effect_u8_chunked(
     rgb_u8: np.ndarray,
     hdr_intensity: float,
@@ -1260,43 +1361,108 @@ def _apply_hdr_effect_u8_chunked(
 
     for y0 in range(0, height, rows_per_chunk):
         y1 = min(height, y0 + rows_per_chunk)
-
-        rgb = rgb_u8[y0:y1].astype(np.float32) / 255.0
-        linear_rgb = _srgb_to_linear(rgb)
-
-        r = linear_rgb[..., 0]
-        g = linear_rgb[..., 1]
-        bl = linear_rgb[..., 2]
-
-        x = (_SRGB_TO_XYZ[0, 0] * r + _SRGB_TO_XYZ[0, 1] * g + _SRGB_TO_XYZ[0, 2] * bl) / _D65_WHITE[0]
-        y = (_SRGB_TO_XYZ[1, 0] * r + _SRGB_TO_XYZ[1, 1] * g + _SRGB_TO_XYZ[1, 2] * bl) / _D65_WHITE[1]
-        z = (_SRGB_TO_XYZ[2, 0] * r + _SRGB_TO_XYZ[2, 1] * g + _SRGB_TO_XYZ[2, 2] * bl) / _D65_WHITE[2]
-
-        fx = _f_xyz_to_lab(x)
-        fy = _f_xyz_to_lab(y)
-        fz = _f_xyz_to_lab(z)
-
-        lightness = (np.float32(116.0) * fy) - np.float32(16.0)
-        a = np.float32(500.0) * (fx - fy)
-        b = np.float32(200.0) * (fy - fz)
-
-        l_uint8 = np.clip(lightness * (255.0 / 100.0), 0, 255).astype(np.uint8)
-        adjusted_l = _apply_hdr_luminance_chunk(
-            l_uint8,
+        rgb_out[y0:y1] = _apply_hdr_effect_u8_one_chunk(
+            rgb_u8[y0:y1],
             hdr_intensity=hdr_intensity,
             shadow_intensity=shadow_intensity,
             highlight_intensity=highlight_intensity,
             gamma_intensity=gamma_intensity,
         )
-        stable_a, stable_b = _stabilize_dark_lab_chroma(rgb_u8[y0:y1], l_uint8, adjusted_l, a, b)
-        rgb_out[y0:y1] = _lab_chunk_to_rgb_u8(adjusted_l, stable_a, stable_b)
-
-        del (
-            rgb, linear_rgb, r, g, bl, x, y, z, fx, fy, fz, lightness,
-            a, b, l_uint8, adjusted_l, stable_a, stable_b,
-        )
 
     return rgb_out
+
+
+def _apply_hdr_frame_streamed_to_output(
+    frame: torch.Tensor,
+    out_frame: torch.Tensor,
+    hdr_intensity: float,
+    shadow_intensity: float,
+    highlight_intensity: float,
+    gamma_intensity: float,
+    contrast: float,
+    enhance_color: float,
+    frame_label: str,
+) -> None:
+    """Apply HDR directly from one input tensor frame into one output tensor frame.
+
+    This two-pass path avoids materializing full-frame rgb_u8 and hdr_u8 arrays.
+    It recomputes the HDR chunk during the write pass so PIL-style contrast still
+    receives a whole-frame mean luminance without storing another full frame.
+    """
+    if out_frame.device.type != "cpu":
+        raise ValueError("HDR Effects writes CPU IMAGE tensors")
+    if out_frame.dtype != torch.float32:
+        raise ValueError(f"HDR Effects expected float32 output, got {out_frame.dtype}")
+
+    tensor = frame.detach()
+    if tensor.ndim == 4:
+        if tensor.shape[0] != 1:
+            raise ValueError(f"Expected a single frame, got tensor shape {tuple(tensor.shape)}")
+        tensor = tensor[0]
+    if tensor.ndim == 2:
+        tensor = tensor.unsqueeze(-1)
+    if tensor.ndim != 3:
+        raise ValueError(f"Expected image tensor with shape HxWxC, got {tuple(tensor.shape)}")
+
+    height, width, channels = (int(v) for v in tensor.shape)
+    if channels not in (1, 3, 4):
+        raise ValueError(f"Expected 1, 3, or 4 channels, got tensor shape {tuple(tensor.shape)}")
+    if tuple(out_frame.shape) != (height, width, 3):
+        raise ValueError(f"Output frame shape mismatch: expected {(height, width, 3)}, got {tuple(out_frame.shape)}")
+
+    frame_pixels = height * width
+    rows_per_chunk = _hdr_rows_per_chunk(width)
+    contrast_factor = np.float32(1.0 + float(contrast))
+    color_factor = np.float32(1.0 + float(enhance_color) * 0.2)
+
+    _hdr_progress(frame_pixels, f"{frame_label}: streaming pass 1/2 luminance start rows_per_chunk={rows_per_chunk}")
+    luma_total = 0.0
+    chunk_index = 0
+    for y0 in range(0, height, rows_per_chunk):
+        y1 = min(height, y0 + rows_per_chunk)
+        rgb_chunk = _tensor_image_rows_to_rgb_u8(tensor, y0, y1)
+        hdr_chunk = _apply_hdr_effect_u8_one_chunk(
+            rgb_chunk,
+            hdr_intensity=hdr_intensity,
+            shadow_intensity=shadow_intensity,
+            highlight_intensity=highlight_intensity,
+            gamma_intensity=gamma_intensity,
+        )
+        luma_total += float(_rgb_luma_float(hdr_chunk).sum(dtype=np.float64))
+        del rgb_chunk, hdr_chunk
+        chunk_index += 1
+        if chunk_index % 16 == 0:
+            _hdr_debug(f"{frame_label}: streaming pass 1/2 processed rows {y1}/{height}")
+
+    mean_luma = np.float32(luma_total / max(1, frame_pixels) + 0.5)
+    _hdr_progress(frame_pixels, f"{frame_label}: streaming pass 1/2 luminance complete mean_luma={float(mean_luma):.3f}")
+
+    _hdr_progress(frame_pixels, f"{frame_label}: streaming pass 2/2 output write start")
+    out_np = out_frame.numpy()
+    chunk_index = 0
+    for y0 in range(0, height, rows_per_chunk):
+        y1 = min(height, y0 + rows_per_chunk)
+        rgb_chunk = _tensor_image_rows_to_rgb_u8(tensor, y0, y1)
+        hdr_chunk = _apply_hdr_effect_u8_one_chunk(
+            rgb_chunk,
+            hdr_intensity=hdr_intensity,
+            shadow_intensity=shadow_intensity,
+            highlight_intensity=highlight_intensity,
+            gamma_intensity=gamma_intensity,
+        )
+        _postprocess_rgb_u8_chunk_to_np(
+            hdr_chunk,
+            out_np[y0:y1],
+            mean_luma=mean_luma,
+            contrast_factor=contrast_factor,
+            color_factor=color_factor,
+        )
+        del rgb_chunk, hdr_chunk
+        chunk_index += 1
+        if chunk_index % 16 == 0:
+            _hdr_debug(f"{frame_label}: streaming pass 2/2 wrote rows {y1}/{height}")
+
+    _hdr_progress(frame_pixels, f"{frame_label}: streaming pass 2/2 output write complete")
 
 
 def _apply_hdr_effect_chunked(
@@ -1486,36 +1652,56 @@ class HDREffects:
         rgb_u8 = None
         hdr_u8 = None
 
+        frame_pixels = height * width
+
         try:
+            _hdr_progress(frame_pixels, f"batch start image_shape={tuple(image.shape)} output_shape={(image_count, height, width, 3)} streaming={_hdr_use_streaming(height, width)}")
             output = torch.empty((image_count, height, width, 3), dtype=torch.float32, device="cpu")
             with _HDR_EFFECTS_LOCK:
                 for index in range(image_count):
-                    _hdr_debug(f"frame {index + 1}/{image_count}: tensor -> rgb_u8 start shape={tuple(image[index].shape)}")
-                    rgb_u8 = _tensor_image_to_rgb_u8_chunked(image[index])
-                    _hdr_debug(f"frame {index + 1}/{image_count}: HDR LAB chunks start")
-                    hdr_u8 = _apply_hdr_effect_u8_chunked(
-                        rgb_u8,
-                        hdr_intensity=hdr_intensity,
-                        shadow_intensity=shadow_intensity,
-                        highlight_intensity=highlight_intensity,
-                        gamma_intensity=gamma_intensity,
-                    )
-                    rgb_u8 = None
+                    frame_label = f"frame {index + 1}/{image_count}"
+                    _hdr_progress(frame_pixels, f"{frame_label}: start shape={tuple(image[index].shape)}")
 
-                    _hdr_debug(f"frame {index + 1}/{image_count}: contrast/color -> output tensor start")
-                    _postprocess_rgb_u8_to_tensor_chunked(
-                        hdr_u8,
-                        output[index],
-                        contrast=contrast,
-                        enhance_color=enhance_color,
-                    )
-                    hdr_u8 = None
+                    if _hdr_use_streaming(height, width):
+                        _apply_hdr_frame_streamed_to_output(
+                            image[index],
+                            output[index],
+                            hdr_intensity=hdr_intensity,
+                            shadow_intensity=shadow_intensity,
+                            highlight_intensity=highlight_intensity,
+                            gamma_intensity=gamma_intensity,
+                            contrast=contrast,
+                            enhance_color=enhance_color,
+                            frame_label=frame_label,
+                        )
+                    else:
+                        _hdr_debug(f"{frame_label}: tensor -> rgb_u8 start shape={tuple(image[index].shape)}")
+                        rgb_u8 = _tensor_image_to_rgb_u8_chunked(image[index])
+                        _hdr_debug(f"{frame_label}: HDR LAB chunks start")
+                        hdr_u8 = _apply_hdr_effect_u8_chunked(
+                            rgb_u8,
+                            hdr_intensity=hdr_intensity,
+                            shadow_intensity=shadow_intensity,
+                            highlight_intensity=highlight_intensity,
+                            gamma_intensity=gamma_intensity,
+                        )
+                        rgb_u8 = None
+
+                        _hdr_debug(f"{frame_label}: contrast/color -> output tensor start")
+                        _postprocess_rgb_u8_to_tensor_chunked(
+                            hdr_u8,
+                            output[index],
+                            contrast=contrast,
+                            enhance_color=enhance_color,
+                        )
+                        hdr_u8 = None
 
                     if output[index].numel() >= 16_777_216:
                         gc.collect()
                         _trim_native_heap()
-                    _hdr_debug(f"frame {index + 1}/{image_count}: done")
+                    _hdr_progress(frame_pixels, f"{frame_label}: done")
 
+            _hdr_progress(frame_pixels, f"batch complete output_shape={tuple(output.shape)}")
             return (output, )
         except Exception:
             output = None
