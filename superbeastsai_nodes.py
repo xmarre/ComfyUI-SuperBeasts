@@ -835,6 +835,21 @@ def _hdr_progress(frame_pixels: int, msg: str) -> None:
         print(f"[SuperBeasts][HDR] {msg}")
 
 
+def _spca_debug(msg: str) -> None:
+    if _safe_bool_env("SUPERBEASTS_SPCA_DEBUG", False):
+        print(f"[SuperBeasts][SPCA] {msg}")
+
+
+def _spca_progress(frame_pixels: int, msg: str) -> None:
+    """Print coarse SuperPop progress for large frames without flooding small runs."""
+    if _safe_bool_env("SUPERBEASTS_SPCA_DEBUG", False):
+        print(f"[SuperBeasts][SPCA] {msg}")
+        return
+    min_pixels = _safe_positive_int_env("SUPERBEASTS_SPCA_PROGRESS_MIN_PIXELS", 4_000_000, 1)
+    if int(frame_pixels) >= min_pixels:
+        print(f"[SuperBeasts][SPCA] {msg}")
+
+
 def _hdr_use_streaming(height: int, width: int) -> bool:
     if not _safe_bool_env("SUPERBEASTS_HDR_STREAMING", True):
         return False
@@ -1789,7 +1804,7 @@ class MakeResizedMaskBatch:
 
 
 def _write_spca_blend_to_output(
-    orig_np_full: np.ndarray,
+    orig_u8_full: np.ndarray,
     residual_full: np.ndarray,
     strength: float,
     out_frame: torch.Tensor,
@@ -1798,14 +1813,15 @@ def _write_spca_blend_to_output(
 
     This preserves the previous PIL round-trip quantization:
     Image.fromarray((clip(base + residual * s) * 255).astype(uint8))
-    followed by pil2tensor(...).
+    followed by pil2tensor(...), but converts original-image rows from uint8
+    to float32 only inside the current chunk.
     """
     if out_frame.device.type != "cpu":
         raise ValueError("SuperPopColorAdjustment writes CPU IMAGE tensors")
     if out_frame.dtype != torch.float32:
         raise ValueError(f"SuperPopColorAdjustment expected float32 output, got {out_frame.dtype}")
 
-    height, width = orig_np_full.shape[:2]
+    height, width = orig_u8_full.shape[:2]
     if tuple(out_frame.shape) != (height, width, 3):
         raise ValueError(
             f"SuperPopColorAdjustment output frame shape mismatch: "
@@ -1819,7 +1835,10 @@ def _write_spca_blend_to_output(
 
     for y0 in range(0, height, rows_per_chunk):
         y1 = min(height, y0 + rows_per_chunk)
-        work = orig_np_full[y0:y1].astype(np.float32, copy=True)
+        work = orig_u8_full[y0:y1].astype(np.float32, copy=True)
+        # Match np.array(original_pil, dtype=np.float32) / 255.0 exactly;
+        # reciprocal multiplication can move borderline pixels by one uint8 code.
+        work /= 255.0
         work += residual_full[y0:y1] * s
         np.clip(work, 0.0, 1.0, out=work)
         work *= np.float32(255.0)
@@ -2404,12 +2423,21 @@ class SuperPopColorAdjustment:
         width = int(image.shape[2])
         output_total = image_count * count
 
-        # Preallocate the final batch.  The old list + torch.cat path held every
-        # per-strength tensor and then allocated the full cat result on top of
-        # them, which is a multi-GB peak for 3800x5568 batches.
-        images_batch = torch.empty((output_total, height, width, 3), dtype=torch.float32, device="cpu")
+        frame_pixels = height * width
+        return_residuals = _safe_bool_env("SUPERBEASTS_SPCA_RETURN_RESIDUALS", True)
+
+        # Allocate the output batch only when the first frame is ready to be
+        # written.  During model patch accumulation this avoids overlapping the
+        # full output batch with residual_acc/counter/original-image temporaries.
+        images_batch = None
         filename_prefixes: list[str] = []
         residual_tensors: list[torch.Tensor] = []
+
+        _spca_progress(
+            frame_pixels,
+            f"batch start image_shape={tuple(image.shape)} output_shape={(output_total, height, width, 3)} "
+            f"count={count} return_residuals={return_residuals}",
+        )
 
         # Cache for the first computed context thumbnail when reusing across batch
         ctx_np_cached = None
@@ -2433,8 +2461,12 @@ class SuperPopColorAdjustment:
             pbar = None
 
         for idx, img_tensor in enumerate(image):
+            frame_label = f"frame {idx + 1}/{image_count}"
+            _spca_progress(frame_pixels, f"{frame_label}: start")
+
             # Convert to PIL for easier colour operations
             original_pil = tensor2pil(img_tensor)
+            _spca_debug(f"{frame_label}: tensor -> PIL complete size={original_pil.size}")
 
             # -------------------------------------------------
             # Prepare / reuse context thumbnail
@@ -2451,6 +2483,8 @@ class SuperPopColorAdjustment:
                 if initial_context_for_batch:
                     ctx_np_cached = ctx_np_global
 
+            _spca_debug(f"{frame_label}: context prepared shape={getattr(ctx_np_global, 'shape', None)}")
+
             # ---------- Patch-based processing ----------
             h, w = original_pil.size[1], original_pil.size[0]
             patch_size = model.get("patch_size", 512) if isinstance(model, dict) else 512
@@ -2465,14 +2499,25 @@ class SuperPopColorAdjustment:
 
             x_positions = self._get_patch_positions(w, patch_size, overlap_px)
             y_positions = self._get_patch_positions(h, patch_size, overlap_px)
+            total_patches = len(x_positions) * len(y_positions)
 
-            orig_np_full = np.array(original_pil, dtype=np.float32) / 255.0
+            # Keep the original frame as uint8 and convert rows to float32 only
+            # while writing output.  A full float32 copy costs ~254 MB at
+            # 3800x5568 and is avoidable because tensor2pil already quantised.
+            orig_u8_full = np.asarray(original_pil, dtype=np.uint8)
 
             # ctx_np_global already prepared above
             weight_full = self._create_patch_weight_map(patch_size, patch_size, overlap_px)
 
+            _spca_progress(
+                frame_pixels,
+                f"{frame_label}: patch accumulation start patches={total_patches} patch_size={patch_size} overlap_px={overlap_px}",
+            )
+            patch_index = 0
+
             for y in y_positions:
                 for x in x_positions:
+                    patch_index += 1
                     patch = original_pil.crop((x, y, x + patch_size, y + patch_size))
                     patch_corrected = self._run_model(model, patch, ctx_np_global)
 
@@ -2539,36 +2584,93 @@ class SuperPopColorAdjustment:
                     residual_acc[y:y + target_h, x:x + target_w, :] += residual_patch * weight[:, :, np.newaxis]
                     counter[y:y + target_h, x:x + target_w, :] += weight[:, :, np.newaxis]
 
-            # Use a tiny epsilon instead of 1.0 so that edge pixels retain their full residual
-            counter = np.maximum(counter, 1e-6)
-            residual_full = residual_acc / counter
+                    # Drop per-patch native temporaries before the next model call.
+                    with contextlib.suppress(NameError):
+                        del patch
+                    with contextlib.suppress(NameError):
+                        del patch_corrected
+                    with contextlib.suppress(NameError):
+                        del orig_patch_np
+                    with contextlib.suppress(NameError):
+                        del corr_patch_np
+                    with contextlib.suppress(NameError):
+                        del residual_patch
+                    with contextlib.suppress(NameError):
+                        del weight
+                    with contextlib.suppress(NameError):
+                        del orig_cropped
+                    with contextlib.suppress(NameError):
+                        del orig_pad
+                    with contextlib.suppress(NameError):
+                        del pad_pil
+                    with contextlib.suppress(NameError):
+                        del corrected_pad_np
+                    with contextlib.suppress(NameError):
+                        del corrected_crop
+
+                    if patch_index % 16 == 0 or patch_index == total_patches:
+                        _spca_progress(frame_pixels, f"{frame_label}: patch accumulation {patch_index}/{total_patches}")
+                        if patch_index % 64 == 0:
+                            gc.collect()
+                            _trim_native_heap()
+
+            _spca_progress(frame_pixels, f"{frame_label}: patch accumulation complete")
+
+            # Use a tiny epsilon instead of 1.0 so that edge pixels retain their full residual,
+            # then normalize in-place.  The previous residual_full = residual_acc / counter
+            # allocated another full HxWx3 float32 array while residual_acc and counter were
+            # still alive.
+            np.maximum(counter, 1e-6, out=counter)
+            np.divide(residual_acc, counter, out=residual_acc)
+            residual_full = residual_acc
+            del counter
+            _spca_progress(frame_pixels, f"{frame_label}: residual normalize complete")
 
             # Generate blended outputs for this frame directly into the final
             # batch tensor.  Keep one residual tensor per source frame and reuse
             # the reference for multiple strengths; residuals are read-only in
             # the downstream blend node, so this avoids duplicating the same
             # 250+ MB residual when count > 1.
+            if images_batch is None:
+                _spca_progress(frame_pixels, f"{frame_label}: output allocation start")
+                images_batch = torch.empty((output_total, height, width, 3), dtype=torch.float32, device="cpu")
+                _spca_progress(frame_pixels, f"{frame_label}: output allocation complete")
+
             strengths = [max_strength * (count - i) / count for i in range(count)]
-            residual_tensor = torch.from_numpy(np.ascontiguousarray(residual_full)).unsqueeze(0).float()
+            residual_tensor = None
+            if return_residuals:
+                _spca_progress(frame_pixels, f"{frame_label}: residual tensor handoff start")
+                residual_tensor = torch.from_numpy(np.ascontiguousarray(residual_full)).unsqueeze(0).float()
+                _spca_progress(frame_pixels, f"{frame_label}: residual tensor handoff complete")
+
+            _spca_progress(frame_pixels, f"{frame_label}: blend write start outputs={len(strengths)}")
             for strength_index, s in enumerate(strengths):
                 out_index = idx * count + strength_index
-                _write_spca_blend_to_output(orig_np_full, residual_full, s, images_batch[out_index])
+                _write_spca_blend_to_output(orig_u8_full, residual_full, s, images_batch[out_index])
                 filename_prefixes.append(f"SPCA_{s:.2f}_")
-                residual_tensors.append(residual_tensor)
+                if residual_tensor is not None:
+                    residual_tensors.append(residual_tensor)
+            _spca_progress(frame_pixels, f"{frame_label}: blend write complete")
 
             # Update progress bar
             if pbar is not None:
                 pbar.update_absolute(idx + 1)
 
             # Release large per-frame temporaries before the next iteration.
-            del original_pil, ctx_np_global, residual_acc, counter, orig_np_full, residual_full, weight_full, residual_tensor
+            del original_pil, ctx_np_global, residual_acc, orig_u8_full, residual_full, weight_full, residual_tensor
             # For long batches this improves prompt-to-prompt memory stability.
             gc.collect()
             _trim_native_heap()
+            _spca_progress(frame_pixels, f"{frame_label}: complete")
 
         # ------------------------------------------------------------------
         # Finalise outputs – filename prefix string is consumed by Save Image.
         # ------------------------------------------------------------------
+
+        if images_batch is None:
+            raise ValueError("SuperPopColorAdjustment received an empty image batch")
+
+        _spca_progress(frame_pixels, f"batch complete output_shape={tuple(images_batch.shape)} residual_count={len(residual_tensors)}")
 
         filename_prefix_str = "".join(filename_prefixes)
         residual_batch = residual_tensors  # keep list per output image
