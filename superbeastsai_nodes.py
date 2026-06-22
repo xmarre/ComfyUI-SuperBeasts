@@ -904,6 +904,25 @@ def _trim_native_heap() -> None:
             _warn_malloc_trim_once(f"call failed: {exc}")
 
 
+def _hdr_gc_trim_checkpoint(frame_pixels: int, label: str) -> None:
+    """Release dead HDR chunk temporaries at large-frame phase boundaries.
+
+    The streaming HDR path intentionally deletes row-chunk arrays during each
+    pass, but WSL/glibc may keep those native allocations resident until the
+    node returns.  For large frames, run an intra-node checkpoint before the
+    second pass starts so the next allocation burst does not overlap with dead
+    pass-1 temporaries.
+    """
+    if not _safe_bool_env("SUPERBEASTS_HDR_PASS_TRIM", True):
+        return
+    min_pixels = _safe_positive_int_env("SUPERBEASTS_HDR_PASS_TRIM_MIN_PIXELS", 4_000_000, 1)
+    if int(frame_pixels) < min_pixels:
+        return
+    gc.collect()
+    _trim_native_heap()
+    _hdr_debug(f"{label}: gc/malloc_trim checkpoint complete")
+
+
 def _hdr_rows_per_chunk(width: int) -> int:
     max_chunk_pixels = _safe_positive_int_env("SUPERBEASTS_HDR_CHUNK_PIXELS", 262_144, 4096)
     return max(1, max_chunk_pixels // max(1, int(width)))
@@ -1452,6 +1471,7 @@ def _apply_hdr_frame_streamed_to_output(
 
     mean_luma = np.float32(luma_total / max(1, frame_pixels) + 0.5)
     _hdr_progress(frame_pixels, f"{frame_label}: streaming pass 1/2 luminance complete mean_luma={float(mean_luma):.3f}")
+    _hdr_gc_trim_checkpoint(frame_pixels, f"{frame_label}: after streaming pass 1/2")
 
     _hdr_progress(frame_pixels, f"{frame_label}: streaming pass 2/2 output write start")
     out_np = out_frame.numpy()
