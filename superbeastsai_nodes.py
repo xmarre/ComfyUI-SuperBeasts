@@ -993,8 +993,8 @@ def _hdr_hang_trace_stop(enabled: bool) -> None:
         return
     try:
         faulthandler.cancel_dump_traceback_later()
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[SuperBeasts][HDR] failed to cancel traceback timer: {e}", file=sys.stderr)
 
 
 def _numpy_image_rows_to_rgb_u8(array: np.ndarray, y0: int, y1: int) -> np.ndarray:
