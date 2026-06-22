@@ -15,6 +15,7 @@ import threading
 import contextlib
 import ctypes
 import gc
+import faulthandler
 from collections import OrderedDict
 
 
@@ -949,6 +950,111 @@ def _hdr_rows_per_chunk(width: int) -> int:
     return max(1, max_chunk_pixels // max(1, int(width)))
 
 
+def _process_rss_mb() -> int | None:
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        with open("/proc/self/statm", "r", encoding="utf-8") as handle:
+            pages = int(handle.read().split()[1])
+        return (pages * os.sysconf("SC_PAGE_SIZE")) // (1024 * 1024)
+    except Exception:
+        return None
+
+
+def _hdr_trace_chunks_enabled() -> bool:
+    return _safe_bool_env("SUPERBEASTS_HDR_TRACE_CHUNKS", False)
+
+
+def _hdr_trace_chunk(frame_label: str, phase: str, y0: int, y1: int, height: int) -> None:
+    if not _hdr_trace_chunks_enabled():
+        return
+    rss_mb = _process_rss_mb()
+    rss_suffix = f" rss={rss_mb}MB" if rss_mb is not None else ""
+    print(f"[SuperBeasts][HDR][trace] {frame_label}: {phase} rows {y0}:{y1}/{height}{rss_suffix}", flush=True)
+
+
+def _hdr_hang_trace_start(frame_label: str) -> bool:
+    timeout_s = _safe_positive_int_env("SUPERBEASTS_HDR_TRACE_TIMEOUT_S", 0, 0)
+    if timeout_s <= 0:
+        return False
+    exit_on_timeout = _safe_bool_env("SUPERBEASTS_HDR_TRACE_TIMEOUT_EXIT", False)
+    try:
+        faulthandler.dump_traceback_later(timeout_s, repeat=True, exit=exit_on_timeout)
+        mode = "exit" if exit_on_timeout else "dump"
+        _hdr_debug(f"{frame_label}: enabled faulthandler {mode} timer every {timeout_s}s")
+        return True
+    except Exception as exc:
+        print(f"[SuperBeasts][HDR] failed to enable traceback timer: {exc}", file=sys.stderr)
+        return False
+
+
+def _hdr_hang_trace_stop(enabled: bool) -> None:
+    if not enabled:
+        return
+    try:
+        faulthandler.cancel_dump_traceback_later()
+    except Exception as e:
+        print(f"[SuperBeasts][HDR] failed to cancel traceback timer: {e}", file=sys.stderr)
+
+
+def _numpy_image_rows_to_rgb_u8(array: np.ndarray, y0: int, y1: int) -> np.ndarray:
+    """Convert rows [y0:y1] of one NumPy-backed Comfy IMAGE frame to RGB uint8."""
+    if array.ndim == 4:
+        if array.shape[0] != 1:
+            raise ValueError(f"Expected a single frame, got array shape {tuple(array.shape)}")
+        array = array[0]
+    if array.ndim == 2:
+        array = array[..., None]
+    if array.ndim != 3:
+        raise ValueError(f"Expected image array with shape HxWxC, got {tuple(array.shape)}")
+
+    height, width, channels = (int(v) for v in array.shape)
+    if channels not in (1, 3, 4):
+        raise ValueError(f"Expected 1, 3, or 4 channels, got array shape {tuple(array.shape)}")
+
+    y0 = max(0, int(y0))
+    y1 = min(height, int(y1))
+    if y1 <= y0:
+        return np.empty((0, width, 3), dtype=np.uint8)
+
+    rows = array[y0:y1]
+    if not rows.flags.c_contiguous:
+        rows = np.ascontiguousarray(rows)
+
+    if channels == 1:
+        gray = np.clip(rows[..., 0] * np.float32(255.0), 0.0, 255.0).astype(np.uint8)
+        rgb = np.empty((y1 - y0, width, 3), dtype=np.uint8)
+        rgb[..., 0] = gray
+        rgb[..., 1] = gray
+        rgb[..., 2] = gray
+        return rgb
+
+    return np.clip(rows[..., :3] * np.float32(255.0), 0.0, 255.0).astype(np.uint8)
+
+
+def _hdr_cpu_numpy_source(tensor: torch.Tensor, frame_label: str) -> np.ndarray | None:
+    """Use one CPU NumPy view for streaming HDR instead of per-chunk torch->numpy calls."""
+    if not _safe_bool_env("SUPERBEASTS_HDR_CPU_NUMPY_VIEW", True):
+        return None
+    if tensor.device.type != "cpu":
+        return None
+    try:
+        array = tensor.numpy()
+    except Exception as exc:
+        _hdr_debug(f"{frame_label}: CPU NumPy view unavailable: {exc}")
+        return None
+    if not array.flags.c_contiguous:
+        _hdr_debug(f"{frame_label}: CPU NumPy view is non-contiguous; using per-chunk tensor conversion")
+        return None
+    return array
+
+
+def _hdr_rows_to_rgb_u8(tensor: torch.Tensor, array_source: np.ndarray | None, y0: int, y1: int) -> np.ndarray:
+    if array_source is not None:
+        return _numpy_image_rows_to_rgb_u8(array_source, y0, y1)
+    return _tensor_image_rows_to_rgb_u8(tensor, y0, y1)
+
+
 def _tensor_image_to_rgb_u8_chunked(image: torch.Tensor) -> np.ndarray:
     """Convert one Comfy IMAGE frame to an RGB uint8 ndarray with bounded temps."""
     tensor = image.detach().cpu()
@@ -997,17 +1103,7 @@ def _tensor_image_rows_to_rgb_u8(image: torch.Tensor, y0: int, y1: int) -> np.nd
         return np.empty((0, width, 3), dtype=np.uint8)
 
     chunk = tensor[y0:y1].detach().cpu()
-    arr = np.ascontiguousarray(chunk.numpy())
-    if channels == 1:
-        src = arr[..., 0]
-        gray = np.clip(src * 255.0, 0.0, 255.0).astype(np.uint8)
-        rgb = np.empty((y1 - y0, width, 3), dtype=np.uint8)
-        rgb[..., 0] = gray
-        rgb[..., 1] = gray
-        rgb[..., 2] = gray
-        return rgb
-
-    return np.clip(arr[..., :3] * 255.0, 0.0, 255.0).astype(np.uint8)
+    return _numpy_image_rows_to_rgb_u8(chunk.numpy(), 0, y1 - y0)
 
 
 def _rgb_luma_float(rgb: np.ndarray) -> np.ndarray:
@@ -1471,57 +1567,72 @@ def _apply_hdr_frame_streamed_to_output(
     contrast_factor = np.float32(1.0 + float(contrast))
     color_factor = np.float32(1.0 + float(enhance_color) * 0.2)
 
-    _hdr_progress(frame_pixels, f"{frame_label}: streaming pass 1/2 luminance start rows_per_chunk={rows_per_chunk}")
-    luma_total = 0.0
-    chunk_index = 0
-    for y0 in range(0, height, rows_per_chunk):
-        y1 = min(height, y0 + rows_per_chunk)
-        rgb_chunk = _tensor_image_rows_to_rgb_u8(tensor, y0, y1)
-        hdr_chunk = _apply_hdr_effect_u8_one_chunk(
-            rgb_chunk,
-            hdr_intensity=hdr_intensity,
-            shadow_intensity=shadow_intensity,
-            highlight_intensity=highlight_intensity,
-            gamma_intensity=gamma_intensity,
-        )
-        luma_total += float(_rgb_luma_float(hdr_chunk).sum(dtype=np.float64))
-        del rgb_chunk, hdr_chunk
-        chunk_index += 1
-        _hdr_loop_trim_checkpoint(frame_pixels, frame_label, "streaming pass 1/2", chunk_index)
-        if chunk_index % 16 == 0:
-            _hdr_debug(f"{frame_label}: streaming pass 1/2 processed rows {y1}/{height}")
+    array_source = _hdr_cpu_numpy_source(tensor, frame_label)
+    _hdr_debug(f"{frame_label}: streaming row source={'cpu_numpy_view' if array_source is not None else 'per_chunk_tensor_numpy'}")
 
-    mean_luma = np.float32(luma_total / max(1, frame_pixels) + 0.5)
-    _hdr_progress(frame_pixels, f"{frame_label}: streaming pass 1/2 luminance complete mean_luma={float(mean_luma):.3f}")
-    _hdr_gc_trim_checkpoint(frame_pixels, f"{frame_label}: after streaming pass 1/2")
+    trace_timer_enabled = _hdr_hang_trace_start(frame_label)
+    try:
+        _hdr_progress(frame_pixels, f"{frame_label}: streaming pass 1/2 luminance start rows_per_chunk={rows_per_chunk}")
+        luma_total = 0.0
+        chunk_index = 0
+        for y0 in range(0, height, rows_per_chunk):
+            y1 = min(height, y0 + rows_per_chunk)
+            _hdr_trace_chunk(frame_label, "pass1 tensor->rgb start", y0, y1, height)
+            rgb_chunk = _hdr_rows_to_rgb_u8(tensor, array_source, y0, y1)
+            _hdr_trace_chunk(frame_label, "pass1 hdr math start", y0, y1, height)
+            hdr_chunk = _apply_hdr_effect_u8_one_chunk(
+                rgb_chunk,
+                hdr_intensity=hdr_intensity,
+                shadow_intensity=shadow_intensity,
+                highlight_intensity=highlight_intensity,
+                gamma_intensity=gamma_intensity,
+            )
+            _hdr_trace_chunk(frame_label, "pass1 luma sum start", y0, y1, height)
+            luma_total += float(_rgb_luma_float(hdr_chunk).sum(dtype=np.float64))
+            del rgb_chunk, hdr_chunk
+            _hdr_trace_chunk(frame_label, "pass1 chunk done", y0, y1, height)
+            chunk_index += 1
+            _hdr_loop_trim_checkpoint(frame_pixels, frame_label, "streaming pass 1/2", chunk_index)
+            if chunk_index % 16 == 0:
+                _hdr_debug(f"{frame_label}: streaming pass 1/2 processed rows {y1}/{height}")
 
-    _hdr_progress(frame_pixels, f"{frame_label}: streaming pass 2/2 output write start")
-    out_np = out_frame.numpy()
-    chunk_index = 0
-    for y0 in range(0, height, rows_per_chunk):
-        y1 = min(height, y0 + rows_per_chunk)
-        rgb_chunk = _tensor_image_rows_to_rgb_u8(tensor, y0, y1)
-        hdr_chunk = _apply_hdr_effect_u8_one_chunk(
-            rgb_chunk,
-            hdr_intensity=hdr_intensity,
-            shadow_intensity=shadow_intensity,
-            highlight_intensity=highlight_intensity,
-            gamma_intensity=gamma_intensity,
-        )
-        _postprocess_rgb_u8_chunk_to_np(
-            hdr_chunk,
-            out_np[y0:y1],
-            mean_luma=mean_luma,
-            contrast_factor=contrast_factor,
-            color_factor=color_factor,
-        )
-        del rgb_chunk, hdr_chunk
-        chunk_index += 1
-        _hdr_loop_trim_checkpoint(frame_pixels, frame_label, "streaming pass 2/2", chunk_index)
-        if chunk_index % 16 == 0:
-            _hdr_debug(f"{frame_label}: streaming pass 2/2 wrote rows {y1}/{height}")
+        mean_luma = np.float32(luma_total / max(1, frame_pixels) + 0.5)
+        _hdr_progress(frame_pixels, f"{frame_label}: streaming pass 1/2 luminance complete mean_luma={float(mean_luma):.3f}")
+        _hdr_gc_trim_checkpoint(frame_pixels, f"{frame_label}: after streaming pass 1/2")
 
-    _hdr_progress(frame_pixels, f"{frame_label}: streaming pass 2/2 output write complete")
+        _hdr_progress(frame_pixels, f"{frame_label}: streaming pass 2/2 output write start")
+        out_np = out_frame.numpy()
+        chunk_index = 0
+        for y0 in range(0, height, rows_per_chunk):
+            y1 = min(height, y0 + rows_per_chunk)
+            _hdr_trace_chunk(frame_label, "pass2 tensor->rgb start", y0, y1, height)
+            rgb_chunk = _hdr_rows_to_rgb_u8(tensor, array_source, y0, y1)
+            _hdr_trace_chunk(frame_label, "pass2 hdr math start", y0, y1, height)
+            hdr_chunk = _apply_hdr_effect_u8_one_chunk(
+                rgb_chunk,
+                hdr_intensity=hdr_intensity,
+                shadow_intensity=shadow_intensity,
+                highlight_intensity=highlight_intensity,
+                gamma_intensity=gamma_intensity,
+            )
+            _hdr_trace_chunk(frame_label, "pass2 postprocess start", y0, y1, height)
+            _postprocess_rgb_u8_chunk_to_np(
+                hdr_chunk,
+                out_np[y0:y1],
+                mean_luma=mean_luma,
+                contrast_factor=contrast_factor,
+                color_factor=color_factor,
+            )
+            del rgb_chunk, hdr_chunk
+            _hdr_trace_chunk(frame_label, "pass2 chunk done", y0, y1, height)
+            chunk_index += 1
+            _hdr_loop_trim_checkpoint(frame_pixels, frame_label, "streaming pass 2/2", chunk_index)
+            if chunk_index % 16 == 0:
+                _hdr_debug(f"{frame_label}: streaming pass 2/2 wrote rows {y1}/{height}")
+
+        _hdr_progress(frame_pixels, f"{frame_label}: streaming pass 2/2 output write complete")
+    finally:
+        _hdr_hang_trace_stop(trace_timer_enabled)
 
 
 def _apply_hdr_effect_chunked(
