@@ -923,6 +923,27 @@ def _hdr_gc_trim_checkpoint(frame_pixels: int, label: str) -> None:
     _hdr_debug(f"{label}: gc/malloc_trim checkpoint complete")
 
 
+
+
+def _hdr_loop_trim_checkpoint(frame_pixels: int, frame_label: str, phase: str, chunk_index: int) -> None:
+    """Release native heap residue during long HDR streaming passes.
+
+    This is intentionally separate from the phase-boundary checkpoint: WSL can
+    wedge while the second large frame is still inside pass 1, before any
+    after-pass trim can run.  The checkpoint runs only for large frames and only
+    when SUPERBEASTS_HDR_LOOP_TRIM_CHUNKS is non-zero.
+    """
+    interval = _safe_positive_int_env("SUPERBEASTS_HDR_LOOP_TRIM_CHUNKS", 0, 0)
+    if interval <= 0 or int(chunk_index) % interval != 0:
+        return
+    min_pixels = _safe_positive_int_env("SUPERBEASTS_HDR_LOOP_TRIM_MIN_PIXELS", 4_000_000, 1)
+    if int(frame_pixels) < min_pixels:
+        return
+    gc.collect()
+    _trim_native_heap()
+    _hdr_debug(f"{frame_label}: {phase}: gc/malloc_trim checkpoint after chunk {chunk_index}")
+
+
 def _hdr_rows_per_chunk(width: int) -> int:
     max_chunk_pixels = _safe_positive_int_env("SUPERBEASTS_HDR_CHUNK_PIXELS", 262_144, 4096)
     return max(1, max_chunk_pixels // max(1, int(width)))
@@ -1466,6 +1487,7 @@ def _apply_hdr_frame_streamed_to_output(
         luma_total += float(_rgb_luma_float(hdr_chunk).sum(dtype=np.float64))
         del rgb_chunk, hdr_chunk
         chunk_index += 1
+        _hdr_loop_trim_checkpoint(frame_pixels, frame_label, "streaming pass 1/2", chunk_index)
         if chunk_index % 16 == 0:
             _hdr_debug(f"{frame_label}: streaming pass 1/2 processed rows {y1}/{height}")
 
@@ -1495,6 +1517,7 @@ def _apply_hdr_frame_streamed_to_output(
         )
         del rgb_chunk, hdr_chunk
         chunk_index += 1
+        _hdr_loop_trim_checkpoint(frame_pixels, frame_label, "streaming pass 2/2", chunk_index)
         if chunk_index % 16 == 0:
             _hdr_debug(f"{frame_label}: streaming pass 2/2 wrote rows {y1}/{height}")
 
