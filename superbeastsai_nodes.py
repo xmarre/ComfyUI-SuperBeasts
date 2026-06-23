@@ -2729,102 +2729,104 @@ class SuperPopColorAdjustment:
             patch_index = 0
             spca_trace_timer = _spca_hang_trace_start(frame_label)
 
-            for y in y_positions:
-                for x in x_positions:
-                    patch_index += 1
-                    _spca_trace_patch(
-                        frame_label,
-                        f"patch {patch_index}/{total_patches}: crop start xy=({x},{y})",
-                    )
-                    patch = original_pil.crop((x, y, x + patch_size, y + patch_size))
-                    _spca_trace_patch(frame_label, f"patch {patch_index}/{total_patches}: model start")
-                    patch_corrected = self._run_model(model, patch, ctx_np_global)
-                    _spca_trace_patch(frame_label, f"patch {patch_index}/{total_patches}: model complete")
+            try:
+                for y in y_positions:
+                    for x in x_positions:
+                        patch_index += 1
+                        _spca_trace_patch(
+                            frame_label,
+                            f"patch {patch_index}/{total_patches}: crop start xy=({x},{y})",
+                        )
+                        patch = original_pil.crop((x, y, x + patch_size, y + patch_size))
+                        _spca_trace_patch(frame_label, f"patch {patch_index}/{total_patches}: model start")
+                        patch_corrected = self._run_model(model, patch, ctx_np_global)
+                        _spca_trace_patch(frame_label, f"patch {patch_index}/{total_patches}: model complete")
 
-                    # Resize patch_corrected to patch size in case model changes size
-                    if patch_corrected.size != (patch_size, patch_size):
-                        _spca_trace_patch(frame_label, f"patch {patch_index}/{total_patches}: resize corrected start")
-                        patch_corrected = patch_corrected.resize((patch_size, patch_size), Image.Resampling.BILINEAR)
-                        _spca_trace_patch(frame_label, f"patch {patch_index}/{total_patches}: resize corrected complete")
-
-                    _spca_trace_patch(frame_label, f"patch {patch_index}/{total_patches}: np convert start")
-                    orig_patch_np = np.array(patch, dtype=np.float32) / 255.0
-                    corr_patch_np = np.array(patch_corrected, dtype=np.float32) / 255.0
-                    _spca_trace_patch(frame_label, f"patch {patch_index}/{total_patches}: np convert complete")
-
-                    # Determine overlap area within the original image boundaries
-                    target_h = min(patch_size, h - y)
-                    target_w = min(patch_size, w - x)
-
-                    # If the patch is already full size use it directly -----------------------
-                    if target_h == patch_size and target_w == patch_size:
-                        residual_patch = corr_patch_np - orig_patch_np
-                    else:
-                        # --------------------------------------------------------------
-                        # Pad the original patch to 512×512 instead of scaling to avoid
-                        # introducing blur / ghosting. Use edge padding.
-                        # --------------------------------------------------------------
-                        # Crop to the valid region before padding
-                        orig_cropped = orig_patch_np[:target_h, :target_w, :]
-
-                        # --- Symmetric edge-padding approach (avoid stretched background artefacts) ---
-                        pad_vert = patch_size - target_h
-                        pad_horz = patch_size - target_w
-                        pad_top = pad_vert // 2
-                        pad_bottom = pad_vert - pad_top
-                        pad_left = pad_horz // 2
-                        pad_right = pad_horz - pad_left
-
-                        # Edge-pad the crop up to (patch_size, patch_size)
-                        orig_pad = np.pad(orig_cropped, (
-                            (pad_top, pad_bottom),
-                            (pad_left, pad_right),
-                            (0, 0)), mode='edge')
-
-                        # Convert to PIL for model inference
-                        pad_pil = Image.fromarray((orig_pad * 255.0).astype(np.uint8))
-
-                        # Run model on padded patch – override earlier corr_patch_np
-                        patch_corrected = self._run_model(model, pad_pil, ctx_np_global)
-
+                        # Resize patch_corrected to patch size in case model changes size
                         if patch_corrected.size != (patch_size, patch_size):
+                            _spca_trace_patch(frame_label, f"patch {patch_index}/{total_patches}: resize corrected start")
                             patch_corrected = patch_corrected.resize((patch_size, patch_size), Image.Resampling.BILINEAR)
+                            _spca_trace_patch(frame_label, f"patch {patch_index}/{total_patches}: resize corrected complete")
 
-                        corrected_pad_np = np.array(patch_corrected, dtype=np.float32) / 255.0
+                        _spca_trace_patch(frame_label, f"patch {patch_index}/{total_patches}: np convert start")
+                        orig_patch_np = np.array(patch, dtype=np.float32) / 255.0
+                        corr_patch_np = np.array(patch_corrected, dtype=np.float32) / 255.0
+                        _spca_trace_patch(frame_label, f"patch {patch_index}/{total_patches}: np convert complete")
 
-                        # Crop back to original region
-                        corrected_crop = corrected_pad_np[pad_top:pad_top + target_h, pad_left:pad_left + target_w, :]
+                        # Determine overlap area within the original image boundaries
+                        target_h = min(patch_size, h - y)
+                        target_w = min(patch_size, w - x)
 
-                        # Residual relative to original crop
-                        residual_patch = corrected_crop - orig_cropped
+                        # If the patch is already full size use it directly -----------------------
+                        if target_h == patch_size and target_w == patch_size:
+                            residual_patch = corr_patch_np - orig_patch_np
+                        else:
+                            # --------------------------------------------------------------
+                            # Pad the original patch to 512×512 instead of scaling to avoid
+                            # introducing blur / ghosting. Use edge padding.
+                            # --------------------------------------------------------------
+                            # Crop to the valid region before padding
+                            orig_cropped = orig_patch_np[:target_h, :target_w, :]
 
-                    # Weight map for smooth blending (same crop)
-                    if target_h != patch_size or target_w != patch_size:
-                        weight = weight_full[pad_top:pad_top + target_h, pad_left:pad_left + target_w]
-                    else:
-                        weight = weight_full[:target_h, :target_w]
+                            # --- Symmetric edge-padding approach (avoid stretched background artefacts) ---
+                            pad_vert = patch_size - target_h
+                            pad_horz = patch_size - target_w
+                            pad_top = pad_vert // 2
+                            pad_bottom = pad_vert - pad_top
+                            pad_left = pad_horz // 2
+                            pad_right = pad_horz - pad_left
 
-                    # Determine the actual location in the full image where this residual belongs
-                    _spca_trace_patch(frame_label, f"patch {patch_index}/{total_patches}: accumulation start target=({target_w}x{target_h})")
-                    residual_acc[y:y + target_h, x:x + target_w, :] += residual_patch * weight[:, :, np.newaxis]
-                    counter[y:y + target_h, x:x + target_w, :] += weight[:, :, np.newaxis]
-                    _spca_trace_patch(frame_label, f"patch {patch_index}/{total_patches}: accumulation complete")
+                            # Edge-pad the crop up to (patch_size, patch_size)
+                            orig_pad = np.pad(orig_cropped, (
+                                (pad_top, pad_bottom),
+                                (pad_left, pad_right),
+                                (0, 0)), mode='edge')
 
-                    # Drop per-patch native temporaries before the next model call.
-                    del patch, patch_corrected, orig_patch_np, corr_patch_np, residual_patch, weight
-                    # These temporaries exist only for edge patches.
-                    with contextlib.suppress(NameError):
-                        del orig_cropped, orig_pad, pad_pil, corrected_pad_np, corrected_crop
+                            # Convert to PIL for model inference
+                            pad_pil = Image.fromarray((orig_pad * 255.0).astype(np.uint8))
 
-                    _spca_loop_trim_checkpoint(frame_pixels, frame_label, patch_index)
-                    if patch_index % 16 == 0 or patch_index == total_patches:
-                        _spca_progress(frame_pixels, f"{frame_label}: patch accumulation {patch_index}/{total_patches}")
-                        if patch_index % 64 == 0:
-                            gc.collect()
-                            _trim_native_heap()
+                            # Run model on padded patch – override earlier corr_patch_np
+                            patch_corrected = self._run_model(model, pad_pil, ctx_np_global)
 
-            _spca_hang_trace_stop(spca_trace_timer)
-            _spca_progress(frame_pixels, f"{frame_label}: patch accumulation complete")
+                            if patch_corrected.size != (patch_size, patch_size):
+                                patch_corrected = patch_corrected.resize((patch_size, patch_size), Image.Resampling.BILINEAR)
+
+                            corrected_pad_np = np.array(patch_corrected, dtype=np.float32) / 255.0
+
+                            # Crop back to original region
+                            corrected_crop = corrected_pad_np[pad_top:pad_top + target_h, pad_left:pad_left + target_w, :]
+
+                            # Residual relative to original crop
+                            residual_patch = corrected_crop - orig_cropped
+
+                        # Weight map for smooth blending (same crop)
+                        if target_h != patch_size or target_w != patch_size:
+                            weight = weight_full[pad_top:pad_top + target_h, pad_left:pad_left + target_w]
+                        else:
+                            weight = weight_full[:target_h, :target_w]
+
+                        # Determine the actual location in the full image where this residual belongs
+                        _spca_trace_patch(frame_label, f"patch {patch_index}/{total_patches}: accumulation start target=({target_w}x{target_h})")
+                        residual_acc[y:y + target_h, x:x + target_w, :] += residual_patch * weight[:, :, np.newaxis]
+                        counter[y:y + target_h, x:x + target_w, :] += weight[:, :, np.newaxis]
+                        _spca_trace_patch(frame_label, f"patch {patch_index}/{total_patches}: accumulation complete")
+
+                        # Drop per-patch native temporaries before the next model call.
+                        del patch, patch_corrected, orig_patch_np, corr_patch_np, residual_patch, weight
+                        # These temporaries exist only for edge patches.
+                        with contextlib.suppress(NameError):
+                            del orig_cropped, orig_pad, pad_pil, corrected_pad_np, corrected_crop
+
+                        _spca_loop_trim_checkpoint(frame_pixels, frame_label, patch_index)
+                        if patch_index % 16 == 0 or patch_index == total_patches:
+                            _spca_progress(frame_pixels, f"{frame_label}: patch accumulation {patch_index}/{total_patches}")
+                            if patch_index % 64 == 0:
+                                gc.collect()
+                                _trim_native_heap()
+
+                _spca_progress(frame_pixels, f"{frame_label}: patch accumulation complete")
+            finally:
+                _spca_hang_trace_stop(spca_trace_timer)
 
             # Use a tiny epsilon instead of 1.0 so that edge pixels retain their full residual,
             # then normalize in-place.  The previous residual_full = residual_acc / counter
