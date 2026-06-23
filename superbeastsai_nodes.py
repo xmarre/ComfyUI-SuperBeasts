@@ -2762,7 +2762,7 @@ class SuperPopColorAdjustment:
                             residual_patch = corr_patch_np - orig_patch_np
                         else:
                             # --------------------------------------------------------------
-                            # Pad the original patch to 512×512 instead of scaling to avoid
+                            # Pad the original patch to 512x512 instead of scaling to avoid
                             # introducing blur / ghosting. Use edge padding.
                             # --------------------------------------------------------------
                             # Crop to the valid region before padding
@@ -2785,7 +2785,7 @@ class SuperPopColorAdjustment:
                             # Convert to PIL for model inference
                             pad_pil = Image.fromarray((orig_pad * 255.0).astype(np.uint8))
 
-                            # Run model on padded patch – override earlier corr_patch_np
+                            # Run model on padded patch - override earlier corr_patch_np
                             patch_corrected = self._run_model(model, pad_pil, ctx_np_global)
 
                             if patch_corrected.size != (patch_size, patch_size):
