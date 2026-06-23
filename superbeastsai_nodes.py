@@ -852,6 +852,54 @@ def _spca_progress(frame_pixels: int, msg: str) -> None:
         print(f"[SuperBeasts][SPCA] {msg}")
 
 
+def _spca_trace_patches_enabled() -> bool:
+    return _safe_bool_env("SUPERBEASTS_SPCA_TRACE_PATCHES", False)
+
+
+def _spca_trace_patch(frame_label: str, msg: str) -> None:
+    if not _spca_trace_patches_enabled():
+        return
+    rss_mb = _process_rss_mb()
+    rss_suffix = f" rss={rss_mb}MB" if rss_mb is not None else ""
+    print(f"[SuperBeasts][SPCA][trace] {frame_label}: {msg}{rss_suffix}", flush=True)
+
+
+def _spca_hang_trace_start(frame_label: str) -> bool:
+    timeout_s = _safe_positive_int_env("SUPERBEASTS_SPCA_TRACE_TIMEOUT_S", 0, 0)
+    if timeout_s <= 0:
+        return False
+    exit_on_timeout = _safe_bool_env("SUPERBEASTS_SPCA_TRACE_TIMEOUT_EXIT", False)
+    try:
+        faulthandler.dump_traceback_later(timeout_s, repeat=True, exit=exit_on_timeout)
+        mode = "exit" if exit_on_timeout else "dump"
+        _spca_debug(f"{frame_label}: enabled faulthandler {mode} timer every {timeout_s}s")
+        return True
+    except Exception as exc:
+        print(f"[SuperBeasts][SPCA] failed to enable traceback timer: {exc}", file=sys.stderr)
+        return False
+
+
+def _spca_hang_trace_stop(enabled: bool) -> None:
+    if not enabled:
+        return
+    try:
+        faulthandler.cancel_dump_traceback_later()
+    except Exception as e:
+        print(f"[SuperBeasts][SPCA] failed to cancel traceback timer: {e}", file=sys.stderr)
+
+
+def _spca_loop_trim_checkpoint(frame_pixels: int, frame_label: str, patch_index: int) -> None:
+    interval = _safe_positive_int_env("SUPERBEASTS_SPCA_LOOP_TRIM_PATCHES", 0, 0)
+    if interval <= 0 or int(patch_index) % interval != 0:
+        return
+    min_pixels = _safe_positive_int_env("SUPERBEASTS_SPCA_LOOP_TRIM_MIN_PIXELS", 4_000_000, 1)
+    if int(frame_pixels) < min_pixels:
+        return
+    gc.collect()
+    _trim_native_heap()
+    _spca_debug(f"{frame_label}: gc/malloc_trim checkpoint after patch {patch_index}")
+
+
 def _hdr_use_streaming(height: int, width: int) -> bool:
     if not _safe_bool_env("SUPERBEASTS_HDR_STREAMING", True):
         return False
@@ -2679,19 +2727,30 @@ class SuperPopColorAdjustment:
                 f"{frame_label}: patch accumulation start patches={total_patches} patch_size={patch_size} overlap_px={overlap_px}",
             )
             patch_index = 0
+            spca_trace_timer = _spca_hang_trace_start(frame_label)
 
             for y in y_positions:
                 for x in x_positions:
                     patch_index += 1
+                    _spca_trace_patch(
+                        frame_label,
+                        f"patch {patch_index}/{total_patches}: crop start xy=({x},{y})",
+                    )
                     patch = original_pil.crop((x, y, x + patch_size, y + patch_size))
+                    _spca_trace_patch(frame_label, f"patch {patch_index}/{total_patches}: model start")
                     patch_corrected = self._run_model(model, patch, ctx_np_global)
+                    _spca_trace_patch(frame_label, f"patch {patch_index}/{total_patches}: model complete")
 
                     # Resize patch_corrected to patch size in case model changes size
                     if patch_corrected.size != (patch_size, patch_size):
+                        _spca_trace_patch(frame_label, f"patch {patch_index}/{total_patches}: resize corrected start")
                         patch_corrected = patch_corrected.resize((patch_size, patch_size), Image.Resampling.BILINEAR)
+                        _spca_trace_patch(frame_label, f"patch {patch_index}/{total_patches}: resize corrected complete")
 
+                    _spca_trace_patch(frame_label, f"patch {patch_index}/{total_patches}: np convert start")
                     orig_patch_np = np.array(patch, dtype=np.float32) / 255.0
                     corr_patch_np = np.array(patch_corrected, dtype=np.float32) / 255.0
+                    _spca_trace_patch(frame_label, f"patch {patch_index}/{total_patches}: np convert complete")
 
                     # Determine overlap area within the original image boundaries
                     target_h = min(patch_size, h - y)
@@ -2746,8 +2805,10 @@ class SuperPopColorAdjustment:
                         weight = weight_full[:target_h, :target_w]
 
                     # Determine the actual location in the full image where this residual belongs
+                    _spca_trace_patch(frame_label, f"patch {patch_index}/{total_patches}: accumulation start target=({target_w}x{target_h})")
                     residual_acc[y:y + target_h, x:x + target_w, :] += residual_patch * weight[:, :, np.newaxis]
                     counter[y:y + target_h, x:x + target_w, :] += weight[:, :, np.newaxis]
+                    _spca_trace_patch(frame_label, f"patch {patch_index}/{total_patches}: accumulation complete")
 
                     # Drop per-patch native temporaries before the next model call.
                     del patch, patch_corrected, orig_patch_np, corr_patch_np, residual_patch, weight
@@ -2755,12 +2816,14 @@ class SuperPopColorAdjustment:
                     with contextlib.suppress(NameError):
                         del orig_cropped, orig_pad, pad_pil, corrected_pad_np, corrected_crop
 
+                    _spca_loop_trim_checkpoint(frame_pixels, frame_label, patch_index)
                     if patch_index % 16 == 0 or patch_index == total_patches:
                         _spca_progress(frame_pixels, f"{frame_label}: patch accumulation {patch_index}/{total_patches}")
                         if patch_index % 64 == 0:
                             gc.collect()
                             _trim_native_heap()
 
+            _spca_hang_trace_stop(spca_trace_timer)
             _spca_progress(frame_pixels, f"{frame_label}: patch accumulation complete")
 
             # Use a tiny epsilon instead of 1.0 so that edge pixels retain their full residual,
