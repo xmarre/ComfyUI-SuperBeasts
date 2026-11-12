@@ -1,6 +1,10 @@
 # Changelog
 All notable changes to this project will be documented here. Dates in **DD/MM/YYYY**.
 
+## Unreleased
+### Added
+- **HDR Look** – new node alongside HDR Effects: float32, edge-aware local tone mapping (guided-filter base/detail split in log luminance) with a filmic base curve, detail boost, hue-preserving luminance scaling, a highlight shoulder instead of clipping, and gamut mapping toward luminance. Neutral settings are an exact no-op. HDR Effects is unchanged.
+
 ## 14/06/2026
 ### Fixed
 - **HDR Effects** – replaced Pillow `ImageCms` LAB conversion with a pure NumPy path to stop hard segfaults on large frames (thanks [@xmarre](https://github.com/xmarre), [#14](https://github.com/SuperBeastsAI/ComfyUI-SuperBeasts/pull/14)).
