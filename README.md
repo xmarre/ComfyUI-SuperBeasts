@@ -23,6 +23,7 @@ New Nodes, new model and workflow provided here or update ComfyUI SuperBeasts.AI
 ### Core
 - [Super Pop Color Adjustment](docs/super-pop-color-adjustment.md)
 - [HDR Effects](docs/hdr-effects.md)
+- [HDR Look](docs/hdr-look.md)
 - [Batch Management (Images & Masks)](docs/batch-management.md)
 - [Context & Workflow Tips](docs/context-and-workflow.md)
 
