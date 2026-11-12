@@ -7,9 +7,9 @@ contrast) on an ordinary display-referred image, entirely in float32:
 2. Edge-aware base/detail split of the log luminance with a self-guided filter
    (He et al., "Guided Image Filtering"), the base/detail structure of
    Durand & Dorsey, "Fast Bilateral Filtering for the Display of HDR Images".
-3. The base layer goes through a filmic curve in stops around the image's
-   median: a midtone slope (contrast) with soft roll-offs that pull large
-   bright areas down and lift large dark areas. The detail layer is
+3. The base layer goes through a filmic curve in stops: a midtone slope
+   (contrast) pivoting on display mid-grey, a soft roll-off of tones near
+   white, and a lift of large areas below the image's median. The detail layer is
    amplified, faded out near black so shadow noise is not boosted.
 4. The new luminance is applied as a per-pixel ratio in linear light, which
    keeps chromaticity (hue and saturation) unchanged.
@@ -22,6 +22,8 @@ and contrast = saturation = 1
 the node returns its input unchanged (up to float rounding).
 """
 from __future__ import annotations
+
+import math
 
 import torch
 
@@ -73,8 +75,10 @@ def _guided_self(x: torch.Tensor, r: int, eps: float) -> torch.Tensor:
     return _box_mean(a, r) * i + _box_mean(b, r) + offset
 
 
-_HIGHLIGHT_RANGE_STOPS = 2.5  # base highlights above the anchor are limited to this at recovery 1
-_SHADOW_RANGE_STOPS = 4.0     # base shadows below the anchor are limited to this at lift 1
+_MID_GREY_STOPS = math.log2(0.18)  # contrast pivot (display mid-grey)
+_HIGHLIGHT_KNEE_STOPS = -1.5  # highlight roll-off starts 1.5 stops below white
+_HIGHLIGHT_RANGE_STOPS = 0.75  # at recovery 1, tones above the knee approach knee + 0.75 stop
+_SHADOW_RANGE_STOPS = 4.0     # base shadows below the median are limited to this at lift 1
 
 
 def _soft_limit(rel: torch.Tensor, range_stops: float, amount: float) -> torch.Tensor:
@@ -116,19 +120,23 @@ def hdr_look_frame(
     base = _guided_self(log_y, r, max(float(edge_preservation), 1e-6))
     detail = log_y - base
 
-    # Anchor at the median of the base layer (a strided sample is enough and fast on 4K+).
+    # Median of the base layer (a strided sample is enough and fast on 4K+); shadow-lift reference.
     step = max(1, int((h * w / 1_000_000) ** 0.5))
     anchor = base[::step, ::step].median()
 
-    # Filmic tone curve on the base layer, in stops around the anchor: midtone slope
-    # `contrast`, with tanh roll-offs whose ceilings shrink as recovery/lift grow
-    # (no roll-off at 0, i.e. a straight line through the anchor).
-    rel = (base - anchor) * float(contrast)
-    base_c = anchor + torch.where(
-        rel > 0,
-        _soft_limit(rel, _HIGHLIGHT_RANGE_STOPS, float(highlight_recovery)),
-        _soft_limit(rel, _SHADOW_RANGE_STOPS, float(shadow_lift)),
-    )
+    # Filmic tone curve on the base layer, in stops. Contrast pivots on display mid-grey
+    # (0.18), not on the image median, so a low-key image is not treated as "all shadow
+    # with a highlight subject". Highlight roll-off only acts near white (above an
+    # absolute knee), so a mid-bright subject such as a face is never pulled down.
+    # Shadow lift compresses large areas below the median. Each step is the identity at
+    # its neutral setting (contrast 1, recovery 0, lift 0).
+    c = _MID_GREY_STOPS + (base - _MID_GREY_STOPS) * float(contrast)
+    if highlight_recovery > 0.0:
+        a_h = _HIGHLIGHT_RANGE_STOPS / float(highlight_recovery)
+        c = torch.where(c > _HIGHLIGHT_KNEE_STOPS,
+                        _HIGHLIGHT_KNEE_STOPS + a_h * torch.tanh((c - _HIGHLIGHT_KNEE_STOPS) / a_h), c)
+    rel = c - anchor
+    base_c = torch.where(rel < 0, anchor + _soft_limit(rel, _SHADOW_RANGE_STOPS, float(shadow_lift)), c)
 
     gain = 1.0 + float(local_contrast) * _smoothstep(_LOG_FLOOR + 2.0, _LOG_FLOOR + 6.0, base)
     # Brightening of the large-scale tones saturates against the headroom left below

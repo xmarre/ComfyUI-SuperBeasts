@@ -6,7 +6,7 @@ A photographic "HDR look" for ordinary SDR images: highlight detail is recovered
 
 1. The image is converted from sRGB to linear light; luminance is taken in log2 (stops).
 2. A self-guided edge-preserving filter splits log luminance into a large-scale **base** layer and a fine **detail** layer, so strong edges do not produce halos.
-3. The base layer goes through a filmic curve in stops around the image's median: a midtone slope (`contrast`) with soft roll-offs that pull large bright areas down (`highlight_recovery`) and lift large dark areas (`shadow_lift`). `exposure` then shifts it; any brightening saturates against the headroom left below white for each pixel's brightest channel, so bright and warm areas keep room for their texture.
+3. The base layer goes through a filmic curve in stops: a midtone slope (`contrast`) pivoting on display mid-grey (0.18), a soft roll-off of tones within about 1.5 stops of white (`highlight_recovery`), and a lift of large areas below the image's median (`shadow_lift`). Using absolute levels for contrast and highlights means a low-key image's subject (for example a face against a dark background) is not treated as a highlight and pulled down. `exposure` then shifts the result; any brightening saturates against the headroom left below white for each pixel's brightest channel, so bright and warm areas keep room for their texture.
 4. The detail layer is multiplied by `1 + local_contrast` and added back; the boost fades out near black so sensor-style shadow noise is not amplified.
 5. The new luminance is applied as a ratio to linear RGB, which keeps every pixel's hue and saturation.
 6. A smooth shoulder on each pixel's brightest channel rolls off anything above white (identity when nothing exceeds white), so no channel clips.
@@ -20,7 +20,7 @@ All processing is float32 on the ComfyUI torch device. With `highlight_recovery 
 | parameter | default | range | effect |
 |---|---|---|---|
 | `strength` | 1.0 | 0–1 | blend between input and full effect |
-| `highlight_recovery` | 0.5 | 0–1 | compress large bright areas toward mid-grey |
+| `highlight_recovery` | 0.5 | 0–1 | roll off large areas close to white to reveal their detail |
 | `shadow_lift` | 0.25 | 0–1 | compress large dark areas toward mid-grey |
 | `contrast` | 1.3 | 0.5–2 | midtone contrast of the large-scale tones |
 | `local_contrast` | 0.9 | 0–3 | amplification of local detail |
