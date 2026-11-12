@@ -17,7 +17,8 @@ contrast) on an ordinary display-referred image, entirely in float32:
    identity when nothing overshoots; remaining out-of-gamut pixels are pulled
    toward their own luminance instead of being clipped per channel.
 
-With highlight_recovery = shadow_lift = local_contrast = 0 and contrast = saturation = 1
+With highlight_recovery = shadow_lift = local_contrast = exposure = black_depth = vibrance = 0
+and contrast = saturation = 1
 the node returns its input unchanged (up to float rounding).
 """
 from __future__ import annotations
@@ -27,6 +28,8 @@ import torch
 _REC709 = (0.2126, 0.7152, 0.0722)
 _LOG_FLOOR = -14.0          # stops; luminance below 2^-14 is treated as black
 _SHOULDER_KNEE = 0.75       # linear luminance where the highlight shoulder starts
+_BASE_CEILING_STOPS = -0.25  # brightened large-scale tones approach this level (log2, just below white to leave room for detail)
+_BLACK_TOE = 0.25           # toe width as a fraction of the frame's median luminance
 
 
 def _srgb_to_linear(x: torch.Tensor) -> torch.Tensor:
@@ -90,13 +93,16 @@ def _smoothstep(e0: float, e1: float, x: torch.Tensor) -> torch.Tensor:
 def hdr_look_frame(
     rgb: torch.Tensor,
     strength: float = 1.0,
-    highlight_recovery: float = 0.4,
-    shadow_lift: float = 0.3,
-    contrast: float = 1.15,
-    local_contrast: float = 0.6,
+    highlight_recovery: float = 0.5,
+    shadow_lift: float = 0.25,
+    contrast: float = 1.3,
+    local_contrast: float = 0.9,
     radius: float = 0.03,
     edge_preservation: float = 0.05,
-    saturation: float = 1.1,
+    saturation: float = 1.15,
+    exposure: float = 0.15,
+    black_depth: float = 0.75,
+    vibrance: float = 0.35,
 ) -> torch.Tensor:
     """Apply the HDR look to one sRGB image (H, W, 3) in [0, 1]. Returns (H, W, 3) in [0, 1]."""
     src = rgb.clamp(0.0, 1.0)
@@ -125,26 +131,62 @@ def hdr_look_frame(
     )
 
     gain = 1.0 + float(local_contrast) * _smoothstep(_LOG_FLOOR + 2.0, _LOG_FLOOR + 6.0, base)
-    log_out = base_c + detail * gain
+    # Brightening of the large-scale tones saturates against the headroom left below
+    # white (in stops), before the detail is added back: bright areas keep their texture
+    # instead of being flattened by the final shoulder. Unchanged or darkened tones pass
+    # through exactly, so neutral settings stay the identity.
+    base_e = base_c + float(exposure)
+    lift = base_e - base
+    # Headroom is measured to the brightest channel reaching 1.0, not luminance: a warm
+    # or saturated colour runs out of room log2(max/Y) stops before its luminance does.
+    chan_offset = torch.log2(lin.max(dim=-1).values.clamp(min=y_floor) / y.clamp(min=y_floor)).clamp(min=0.0)
+    headroom = (_BASE_CEILING_STOPS - base - chan_offset).clamp(min=1e-3)
+    base_e = torch.where(lift > 0, base + headroom * torch.tanh(lift / headroom), base_e)
+    log_out = base_e + detail * gain
 
     ratio = torch.exp2(log_out) / y.clamp(min=y_floor)
     out = lin * ratio[..., None]
 
-    # Highlight shoulder: extended-Reinhard above the knee with the white point at the
-    # frame's peak luminance; exact identity when the peak does not exceed 1.0.
-    y_out = _luminance(out)
-    peak = float(y_out.max().clamp(min=1.0))
+    # Highlight shoulder on each pixel's max channel (so no channel exceeds 1 and channel
+    # ratios, i.e. hue, are kept): extended-Reinhard above the knee with the white point
+    # at the frame's peak; exact identity when no channel exceeds 1.0.
+    m = out.max(dim=-1).values
+    peak = float(m.max().clamp(min=1.0))
     if peak > 1.0:
         knee = _SHOULDER_KNEE
-        x = ((y_out - knee) / (1.0 - knee)).clamp(min=0.0)
+        x = ((m - knee) / (1.0 - knee)).clamp(min=0.0)
         wp = (peak - knee) / (1.0 - knee)
         x_c = x * (1.0 + x / (wp * wp)) / (1.0 + x)
-        y_c = torch.where(y_out > knee, knee + (1.0 - knee) * x_c, y_out)
-        out = out * (y_c / y_out.clamp(min=1e-12))[..., None]
-        y_out = y_c
+        m_c = torch.where(m > knee, knee + (1.0 - knee) * x_c, m)
+        out = out * (m_c / m.clamp(min=1e-12))[..., None]
+    y_out = _luminance(out)
 
-    if saturation != 1.0:
-        out = y_out[..., None] + (out - y_out[..., None]) * float(saturation)
+    # Black toe: Y' = Y * (Y (1 + b) / (Y + b))^g with g = black_depth / 2. Darkens
+    # progressively below ~b (in stops, by up to g per stop), leaves white fixed and barely
+    # moves midtones; applied as a luminance ratio so hue is kept.
+    if black_depth > 0.0:
+        # Toe width scales with the frame's median luminance, so "black" means black for
+        # this scene (a dim interior is not crushed into its own midtones).
+        y_med = y_out[::step, ::step].median().clamp(min=1e-4)
+        b = _BLACK_TOE * y_med
+        g = 0.5 * float(black_depth)
+        y_t = y_out * (y_out * (1.0 + b) / (y_out + b)) ** g
+        out = out * (y_t / y_out.clamp(min=1e-12))[..., None]
+        y_out = y_t
+
+    # Saturation, plus vibrance: extra chroma for muted pixels, little for saturated ones.
+    if saturation != 1.0 or vibrance != 0.0:
+        chroma = out - y_out[..., None]
+        factor = torch.full_like(y_out, float(saturation))
+        if vibrance != 0.0:
+            cmax = out.max(dim=-1).values
+            sat_px = ((cmax - out.min(dim=-1).values) / cmax.clamp(min=1e-6)).clamp(0.0, 1.0)
+            factor = factor * (1.0 + float(vibrance) * (1.0 - sat_px))
+        # Path to white: a chroma *boost* fades out toward white so bright colours are
+        # not pushed out of gamut (reductions apply everywhere).
+        boost_fade = 1.0 - _smoothstep(0.4, 1.0, y_out)
+        factor = torch.where(factor > 1.0, 1.0 + (factor - 1.0) * boost_fade, factor)
+        out = y_out[..., None] + chroma * factor[..., None]
 
     # Gamut map toward the pixel's own luminance instead of clipping channels.
     yy = y_out[..., None].clamp(0.0, 1.0)
@@ -184,20 +226,26 @@ class HDRLook:
                 "image": ("IMAGE",),
                 "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,
                                        "tooltip": "Blend between the input (0) and the full effect (1)."}),
-                "highlight_recovery": ("FLOAT", {"default": 0.4, "min": 0.0, "max": 1.0, "step": 0.01,
+                "highlight_recovery": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01,
                                                  "tooltip": "Compresses large bright areas toward mid-grey to reveal highlight detail."}),
-                "shadow_lift": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.01,
+                "shadow_lift": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.01,
                                           "tooltip": "Compresses large dark areas toward mid-grey to reveal shadow detail."}),
-                "contrast": ("FLOAT", {"default": 1.15, "min": 0.5, "max": 2.0, "step": 0.01,
+                "contrast": ("FLOAT", {"default": 1.3, "min": 0.5, "max": 2.0, "step": 0.01,
                                        "tooltip": "Midtone contrast of the large-scale tones; 1.0 keeps the input's."}),
-                "local_contrast": ("FLOAT", {"default": 0.6, "min": 0.0, "max": 3.0, "step": 0.01,
+                "local_contrast": ("FLOAT", {"default": 0.9, "min": 0.0, "max": 3.0, "step": 0.01,
                                              "tooltip": "Amplifies detail relative to its surroundings (the 'HDR' punch)."}),
                 "radius": ("FLOAT", {"default": 0.03, "min": 0.002, "max": 0.25, "step": 0.001,
                                      "tooltip": "Size of the local region as a fraction of the image's short side."}),
                 "edge_preservation": ("FLOAT", {"default": 0.05, "min": 0.001, "max": 2.0, "step": 0.001,
                                                 "tooltip": "Lower keeps edges sharper (fewer halos); higher behaves more like a plain blur."}),
-                "saturation": ("FLOAT", {"default": 1.1, "min": 0.0, "max": 2.0, "step": 0.01,
+                "saturation": ("FLOAT", {"default": 1.15, "min": 0.0, "max": 2.0, "step": 0.01,
                                          "tooltip": "Saturation in linear light; 1.0 keeps the input's saturation."}),
+                "exposure": ("FLOAT", {"default": 0.15, "min": -2.0, "max": 2.0, "step": 0.01,
+                                       "tooltip": "Overall brightness in stops; highlights still roll off instead of clipping."}),
+                "black_depth": ("FLOAT", {"default": 0.75, "min": 0.0, "max": 3.0, "step": 0.01,
+                                          "tooltip": "Deepens near-black tones (richer blacks) while leaving midtones and white nearly untouched."}),
+                "vibrance": ("FLOAT", {"default": 0.35, "min": -1.0, "max": 2.0, "step": 0.01,
+                                       "tooltip": "Boosts muted colours more than already-saturated ones (skin and strong reds are protected)."}),
             }
         }
 
@@ -206,7 +254,7 @@ class HDRLook:
     CATEGORY = "SuperBeastsAI/Image"
 
     def apply(self, image, strength, highlight_recovery, shadow_lift, contrast, local_contrast,
-              radius, edge_preservation, saturation):
+              radius, edge_preservation, saturation, exposure=0.15, black_depth=0.75, vibrance=0.35):
         device = _processing_device(image)
         frames = []
         with torch.no_grad():
@@ -216,6 +264,7 @@ class HDRLook:
                     frame, strength=strength, highlight_recovery=highlight_recovery,
                     shadow_lift=shadow_lift, contrast=contrast, local_contrast=local_contrast, radius=radius,
                     edge_preservation=edge_preservation, saturation=saturation,
+                    exposure=exposure, black_depth=black_depth, vibrance=vibrance,
                 )
                 frames.append(out.to(device=image.device, dtype=image.dtype))
                 del frame, out

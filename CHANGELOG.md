@@ -3,7 +3,7 @@ All notable changes to this project will be documented here. Dates in **DD/MM/YY
 
 ## Unreleased
 ### Added
-- **HDR Look** – new node alongside HDR Effects: float32, edge-aware local tone mapping (guided-filter base/detail split in log luminance) with a filmic base curve, detail boost, hue-preserving luminance scaling, a highlight shoulder instead of clipping, and gamut mapping toward luminance. Neutral settings are an exact no-op. HDR Effects is unchanged.
+- **HDR Look** – new node alongside HDR Effects: float32, edge-aware local tone mapping (guided-filter base/detail split in log luminance) with a filmic base curve, detail boost, hue-preserving luminance scaling, a highlight shoulder instead of clipping, and gamut mapping toward luminance. Includes exposure, scene-relative black depth and vibrance controls. Neutral settings are an exact no-op. HDR Effects is unchanged.
 
 ## 14/06/2026
 ### Fixed
