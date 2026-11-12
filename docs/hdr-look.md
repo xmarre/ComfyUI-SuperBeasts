@@ -20,20 +20,21 @@ All processing is float32 on the ComfyUI torch device. With `highlight_recovery 
 | parameter | default | range | effect |
 |---|---|---|---|
 | `strength` | 1.0 | 0–1 | blend between input and full effect |
-| `highlight_recovery` | 0.5 | 0–1 | compress large bright areas toward mid-grey |
-| `shadow_lift` | 0.25 | 0–1 | compress large dark areas toward mid-grey |
-| `contrast` | 1.3 | 0.5–2 | midtone contrast of the large-scale tones |
-| `local_contrast` | 0.9 | 0–3 | amplification of local detail |
+| `highlight_recovery` | 0.4 | 0–1 | compress large bright areas toward mid-grey |
+| `shadow_lift` | 0.3 | 0–1 | compress large dark areas toward mid-grey |
+| `contrast` | 1.15 | 0.5–2 | midtone contrast of the large-scale tones |
+| `local_contrast` | 0.6 | 0–3 | amplification of local detail |
 | `radius` | 0.03 | 0.002–0.25 | size of the "local" region, as a fraction of the short image side |
 | `edge_preservation` | 0.05 | 0.001–2 | lower keeps edges sharper (fewer halos), higher acts more like a blur |
-| `saturation` | 1.15 | 0–2 | chroma scale in linear light |
+| `saturation` | 1.1 | 0–2 | chroma scale in linear light |
 | `exposure` | 0.15 | −2–2 | overall brightness in stops |
 | `black_depth` | 0.75 | 0–3 | deeper, richer blacks relative to the scene |
 | `vibrance` | 0.35 | −1–2 | extra saturation for muted colours, protecting already-saturated ones |
 
 Starting points (highlight_recovery / contrast / local_contrast / saturation / exposure / black_depth / vibrance):
 - subtle: `0.3 / 1.1 / 0.4 / 1.05 / 0 / 0.3 / 0.15`
-- punchy (defaults): `0.5 / 1.3 / 0.9 / 1.15 / 0.15 / 0.75 / 0.35`
+- defaults: `0.4 / 1.15 / 0.6 / 1.1 / 0.15 / 0.75 / 0.35`
+- punchy: `0.5 / 1.3 / 0.9 / 1.15 / 0.15 / 0.75 / 0.35`
 - strong: `0.6 / 1.45 / 1.3 / 1.25 / 0.3 / 1.5 / 0.6`
 
 ### Tests
